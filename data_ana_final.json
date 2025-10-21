@@ -1,0 +1,2723 @@
+{
+  "name": "Selfwfl",
+  "nodes": [
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "import pandas as pd\nfrom datetime import datetime, timedelta\nimport numpy as np\n\n# Lấy toàn bộ dữ liệu từ node trước (Google Sheet rows)\nitems = _input.all()\ndata = [item.json for item in items]\n\n# Đưa vào DataFrame\ndf = pd.DataFrame(data)\n\n# Đổi tên cột (tuỳ sheet có đủ các trường nào)\ndf = df.rename(columns={\n    'Mã khách hàng': 'customer_id',\n    'Email': 'email',\n    'Khách hàng': 'customer_name',\n    'Ngày đặt hàng': 'order_date',\n    'Số đơn hàng': 'order_count',\n    'Giá trị đơn hàng': 'order_value',\n    'Mã hàng hóa': 'product_id',\n    'Loại hàng hóa': 'product_type',\n    'Tỉnh/Thành phố (Giao hàng)': 'province'\n})\n\n# ===== Sửa: chuyển kiểu ngày an toàn =====\ndef parse_gsheet_date(v):\n    if pd.isna(v):\n        return pd.NaT\n    if isinstance(v, (int, float)) and not pd.isna(v):  \n        # Trường hợp serial date từ Excel/Sheets\n        return pd.Timestamp(\"1899-12-30\") + pd.to_timedelta(int(v), unit=\"D\")\n    s = str(v).strip()\n    if not s:\n        return pd.NaT\n    # Thử parse với dd/mm/yyyy trước\n    for fmt in (\"%d/%m/%Y\", \"%d-%m-%Y\", \"%Y-%m-%d\", \"%m/%d/%Y\", \"%m-%d-%Y\"):\n        try:\n            return pd.to_datetime(s, format=fmt, dayfirst=True)\n        except Exception:\n            pass\n    return pd.to_datetime(s, errors=\"coerce\", dayfirst=True)\n\ndf['order_date'] = df['order_date'].apply(parse_gsheet_date)\ndf['order_value'] = pd.to_numeric(df.get('order_value'), errors='coerce')\n\n# Làm sạch SKU và tạo khóa SKU dùng để tính chu kỳ\nfor col in ['product_id','product_type']:\n    if col not in df.columns:\n        df[col] = pd.NA\n    df[col] = df[col].astype(str).str.strip()\n    df.loc[df[col].str.lower().isin(['', 'nan', 'none', 'null']), col] = pd.NA\n\ndf['sku_key'] = df['product_id'].fillna(df['product_type'])\n\n# Ngày hiện tại\ntoday = pd.Timestamp(datetime.today().date())\n\n# ================== RFM ==================\nrfm = df.dropna(subset=['customer_id', 'order_date', 'order_value']).copy()\nrfm_group = rfm.groupby('customer_id', dropna=True)\n\nrecency = rfm_group['order_date'].max().apply(lambda x: (today - x).days)\nrecency = recency.clip(lower=0)   # tránh recency âm\n\nlast_90 = today - timedelta(days=90)\nfrequency = rfm_group['order_date'].apply(lambda x: (x >= last_90).sum())\nmonetary = rfm_group.apply(lambda x: x.loc[x['order_date'] >= last_90, 'order_value'].sum())\n\nrfm_result = pd.DataFrame({\n    'customer_id': recency.index,\n    'recency': recency.values,\n    'frequency': frequency.values,\n    'monetary': monetary.values\n})\n\n# Rank phần trăm\nrfm_result['freq_rank'] = rfm_result['frequency'].rank(pct=True)\nrfm_result['monetary_rank'] = rfm_result['monetary'].rank(pct=True)\n\n# Recency score (qcut 5 nhóm)\nrfm_result['recency_score'] = pd.qcut(rfm_result['recency'], 5, labels=[5,4,3,2,1]).astype(int)\n\n# Điểm RFM\nrfm_result['RFM_score'] = (\n    5 * rfm_result['freq_rank'] +\n    3 * rfm_result['monetary_rank'] +\n    2 * rfm_result['recency_score']\n)\n\n# ---- Phân loại A/B/C ----\ndef classify_segment(row):\n    if row['recency'] <= 30 or row['monetary_rank'] >= 0.8 or row['frequency'] >= 3:\n        return 'A'\n    elif (31 <= row['recency'] <= 60) or (0.2 <= row['monetary_rank'] < 0.5):\n        return 'B'\n    else:\n        return 'C'\nrfm_result['segment'] = rfm_result.apply(classify_segment, axis=1)\n\n# ================== Chu kỳ mua KH×SKU ==================\ncycle_src = df.dropna(subset=['customer_id', 'order_date', 'sku_key']).copy()\npurchase_rows = []\nfor (cust, sku), g in cycle_src.groupby(['customer_id', 'sku_key'], dropna=True):\n    g = g.sort_values('order_date')\n    deltas = g['order_date'].diff().dt.days.dropna()\n    if len(deltas) > 0:\n        med_cycle = max(1, int(round(np.median(deltas))))\n    else:\n        med_cycle = np.nan\n    last_purchase = g['order_date'].max()\n    if pd.notna(med_cycle):\n        warn_due = last_purchase + pd.to_timedelta(0.2 * med_cycle, unit='D')\n        is_warning = today > warn_due\n        overdue_days = int((today - warn_due).days) if is_warning else 0\n    else:\n        is_warning = False\n        overdue_days = 0\n    purchase_rows.append({\n        'customer_id': cust,\n        'sku_key': str(sku),\n        'purchase_cycle': med_cycle,\n        'last_purchase': last_purchase,\n        'warning': bool(is_warning),\n        'overdue_days': overdue_days\n    })\n\ncycle_df = pd.DataFrame(purchase_rows)\nif not cycle_df.empty:\n    valid_sku = cycle_df['sku_key'].astype(str).str.strip()\n    cycle_df = cycle_df.assign(sku_key=valid_sku)\n    flagged = cycle_df[(cycle_df['warning']) & (cycle_df['sku_key'] != '') & (cycle_df['sku_key'].notna())]\nelse:\n    flagged = cycle_df\n\nif not flagged.empty:\n    warning_summary = (\n        flagged.groupby('customer_id')['sku_key']\n        .apply(list)\n        .reset_index()\n        .rename(columns={'sku_key': 'warning_products'})\n    )\nelse:\n    warning_summary = pd.DataFrame(columns=['customer_id','warning_products'])\n\n# ================== Merge thông tin khách hàng ==================\ninfo_cols = ['customer_id', 'email', 'customer_name', 'province']\nrfm_info = df[info_cols].drop_duplicates(subset=['customer_id'])\n\nrfm_final = pd.merge(rfm_info, rfm_result, on='customer_id', how='right')\nrfm_final = pd.merge(rfm_final, warning_summary, on='customer_id', how='left')\n\nrfm_final['warning_products'] = rfm_final['warning_products'].apply(\n    lambda x: x if isinstance(x, list) else []\n)\n\noutput = rfm_final.to_dict(orient='records')\nreturn output"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        -544
+      ],
+      "id": "903dd3bc-0cd4-4be3-b587-c71f0902736c",
+      "name": "RFM"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction segValue(seg) {\n  if (seg === \"A\") return 0;\n  if (seg === \"B\") return 1;\n  if (seg === \"C\") return 2;\n  return 3;\n}\n\nconst sorted = items.sort((a, b) => {\n  const warnDiff = (b.json.warning_products?.length || 0) - (a.json.warning_products?.length || 0);\n  if (warnDiff !== 0) return warnDiff;\n\n  const segDiff = segValue(a.json.segment) - segValue(b.json.segment);\n  if (segDiff !== 0) return segDiff;\n\n  return (b.json.RFM_score || 0) - (a.json.RFM_score || 0);\n});\n\nreturn sorted;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        96,
+        -288
+      ],
+      "id": "636dd06e-5fc6-42d8-afa9-9a2166d2bd62",
+      "name": "sort"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -608,
+        -544
+      ],
+      "id": "908b3285-7a81-4374-8b3a-a4ca06ce7af6",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "17uST_WjNlH9PPs6BMFtYrM8jSuhjYP0evDbqDgKSrQY",
+          "mode": "list",
+          "cachedResultName": "Saleorder",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/17uST_WjNlH9PPs6BMFtYrM8jSuhjYP0evDbqDgKSrQY/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1589665240,
+          "mode": "list",
+          "cachedResultName": "Danh sách",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/17uST_WjNlH9PPs6BMFtYrM8jSuhjYP0evDbqDgKSrQY/edit#gid=1589665240"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -288,
+        -352
+      ],
+      "id": "baa5a648-9c3c-4c8d-9b84-39c44da817c9",
+      "name": "Get row(s) in sheet1",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1L0O92iT5gZxdRgkVeiFTb2VI5Cpv0TzCRWOx_vPHrWI",
+          "mode": "list",
+          "cachedResultName": "Account",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1L0O92iT5gZxdRgkVeiFTb2VI5Cpv0TzCRWOx_vPHrWI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 546802706,
+          "mode": "list",
+          "cachedResultName": "Danh sách",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1L0O92iT5gZxdRgkVeiFTb2VI5Cpv0TzCRWOx_vPHrWI/edit#gid=546802706"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -288,
+        -720
+      ],
+      "id": "527617fd-c72e-48d5-94b9-f013408c6632",
+      "name": "Get row(s) in sheet3",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "10nGYWBYG0SAMknehsVg98H9eTl1FuaQuy2Y6hxbj-Hw",
+          "mode": "list",
+          "cachedResultName": "Product",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/10nGYWBYG0SAMknehsVg98H9eTl1FuaQuy2Y6hxbj-Hw/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 14657837,
+          "mode": "list",
+          "cachedResultName": "Danh sách",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/10nGYWBYG0SAMknehsVg98H9eTl1FuaQuy2Y6hxbj-Hw/edit#gid=14657837"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -288,
+        -544
+      ],
+      "id": "5161406f-702e-47c9-98bc-78d202e49fd9",
+      "name": "Get row(s) in sheet4",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mỗi input sẽ là một mảng JSON từ các node trước\n// items[0], items[1], items[2], items[3]\n\nlet merged = [];\n\n// Duyệt qua tất cả các input\nfor (let i = 0; i < items.length; i++) {\n  merged = merged.concat(items[i].json);\n}\n\n// Trả ra kết quả đã nối\nreturn merged.map(row => ({ json: row }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        192,
+        -544
+      ],
+      "id": "4fa89d3f-66ef-4a85-8c1b-2413cb5c601f",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        -48,
+        -560
+      ],
+      "id": "4b21bd68-4561-4a3a-89e7-03c425ea4833",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map(i => i.json);\n\n// ===== CHUYỂN KIỂU DỮ LIỆU =====\nitems.forEach(i => {\n  i.recency = Number(i.recency) || 0;\n  i.RFM_score = Number(i.RFM_score) || 0;\n  i.monetary = Number(i.monetary) || 0;\n});\n\n// ===== LẤY DANH SÁCH NGÀY LÀM VIỆC =====\nconst today = new Date();\nconst endDate = new Date();\nendDate.setDate(today.getDate() + 90);\n\nlet workdays = [];\nlet d = new Date(today);\n\nwhile (d <= endDate) {\n  const weekday = d.getDay(); // 0=CN, 6=Thứ 7\n  if (weekday !== 0) {\n    workdays.push(new Date(d));\n  }\n  d.setDate(d.getDate() + 1);\n}\n\n// ===== XOÁ CỘT CŨ =====\nitems.forEach(i => {\n  delete i[\"nhân viên\"];\n  delete i[\"ngày gọi\"];\n  delete i[\"đã gọi\"];\n});\n\n// ===== SẮP XẾP ƯU TIÊN =====\nlet dfPriority = items.filter(i => i.recency === 0 || i.recency === 1);\nlet dfRest = items.filter(i => !(i.recency === 0 || i.recency === 1));\n\ndfPriority.sort((a,b) => (b.RFM_score - a.RFM_score) || (b.monetary - a.monetary));\ndfRest.sort((a,b) => (b.RFM_score - a.RFM_score) || (b.monetary - a.monetary));\n\nlet df = [...dfPriority, ...dfRest];\n\n// ===== GÁN NHÂN VIÊN & NGÀY GỌI (UTC+7 - Bangkok) =====\nfunction toBangkokDate(date) {\n  // offset +7h\n  const offsetMs = 7 * 60 * 60 * 1000;\n  const local = new Date(date.getTime() + offsetMs);\n  return local.toISOString().split(\"T\")[0];\n}\n\ndf.forEach((cust, i) => {\n  cust[\"nhân viên\"] = \"NVCSKH1\";\n  const callDate = workdays[Math.floor(i/30)];\n  cust[\"ngày gọi\"] = toBangkokDate(callDate);\n  cust[\"đã gọi\"] = \"0\";\n});\n\nreturn df.map(i => ({ json: i }));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        352,
+        -288
+      ],
+      "id": "7b27d226-90d2-47b5-9a15-5361ef7f726b",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "58372a59-5c95-4ea0-a20a-2a4cf84b239c",
+              "leftValue": "={{ $json['ngày gọi'] }}",
+              "rightValue": "={{ $now.setZone('Asia/Ho_Chi_Minh').toFormat(\"yyyy-MM-dd\") }}\n",
+              "operator": {
+                "type": "dateTime",
+                "operation": "beforeOrEquals"
+              }
+            },
+            {
+              "id": "fd6dad70-1106-4f02-b341-b73e6b1788f9",
+              "leftValue": "={{ $json['đã gọi'] }}",
+              "rightValue": "0",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        80,
+        -48
+      ],
+      "id": "7eec8a6a-a59f-4e10-b8ba-08d1b0c6b26f",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "filter": {
+          "folderId": {
+            "__rl": true,
+            "value": "1YLAhe7wC0xn7x62RhNXg38gOD0Qb5BOA",
+            "mode": "list",
+            "cachedResultName": "G8",
+            "cachedResultUrl": "https://drive.google.com/drive/folders/1YLAhe7wC0xn7x62RhNXg38gOD0Qb5BOA"
+          }
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -368,
+        272
+      ],
+      "id": "f7f6b469-aad4-401f-8034-0274e744ea05",
+      "name": "search_file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "7eC8YE4FRaHn494y",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        -144,
+        272
+      ],
+      "id": "7ce81ace-0a75-4adf-b4e1-900d8a264215",
+      "name": "dowload",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "7eC8YE4FRaHn494y",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        128,
+        272
+      ],
+      "id": "eea3516e-5703-49bb-9c98-b7aa746fe894",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "options": {
+          "systemMessage": "=## Overview:\n- Bạn là AI trợ lý riêng của người dùng. Nhiệm vụ của bạn là tiếp nhận và hỗ trợ giải đáp thắc mắc dựa trên tài liệu nội bộ và dữ liệu được truyền từ các node trước đó.\n\n## Công Cụ:\n- `dulieu`: Chứa dữ liệu nội bộ, dùng để tìm kiếm thông tin trước khi đưa ra phản hồi.\n\n## Hướng dẫn:\n1. Luôn ưu tiên gọi công cụ `dulieu` để kiểm tra tài liệu nội bộ.\n2. Nếu trong `dulieu` không có thông tin phù hợp, hãy sử dụng dữ liệu từ node trước (các trường như rfm, segment, danh sách sản phẩm quá hạn, …) để sáng tạo phản hồi hợp lý.\n3. Nếu cả hai nguồn không có thông tin, phản hồi dựa trên hiểu biết chung của bạn.\n4. Giao tiếp chuyên nghiệp, rõ ràng, nhưng tự nhiên và gần gũi (không máy móc).\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1568,
+        -48
+      ],
+      "id": "0f5f0501-ea4e-430a-8c45-b7a042ee8e40",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "name": "dulieu",
+        "description": "Chứa dữ liệu nội bộ, truy vấn để tìm thông tin trả lời câu hỏi của người dùng"
+      },
+      "type": "@n8n/n8n-nodes-langchain.toolVectorStore",
+      "typeVersion": 1,
+      "position": [
+        1840,
+        144
+      ],
+      "id": "3a187593-73ac-4b04-b3ce-2720ead270c6",
+      "name": "Answer questions with a vector store"
+    },
+    {
+      "parameters": {
+        "pineconeIndex": {
+          "__rl": true,
+          "value": "n8nself",
+          "mode": "list",
+          "cachedResultName": "n8nself"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePinecone",
+      "typeVersion": 1,
+      "position": [
+        1936,
+        272
+      ],
+      "id": "9bd8262e-aa20-455f-b90b-41955f349a5d",
+      "name": "Pinecone Vector Store1",
+      "credentials": {
+        "pineconeApi": {
+          "id": "QJxs3mRXmRCzt2Zc",
+          "name": "PineconeApi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "pineconeIndex": {
+          "__rl": true,
+          "value": "n8nself",
+          "mode": "list",
+          "cachedResultName": "n8nself"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePinecone",
+      "typeVersion": 1,
+      "position": [
+        400,
+        224
+      ],
+      "id": "856bc280-32c1-43e3-bc00-67db02cb085e",
+      "name": "Pinecone Vector Store2",
+      "credentials": {
+        "pineconeApi": {
+          "id": "QJxs3mRXmRCzt2Zc",
+          "name": "PineconeApi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "dataType": "binary",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1,
+      "position": [
+        560,
+        416
+      ],
+      "id": "c889bb02-3c4d-47df-88ac-459044b13ed8",
+      "name": "Default Data Loader1"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [
+        720,
+        624
+      ],
+      "id": "843f0a17-da1a-418b-9dc5-44116ce32ec8",
+      "name": "Recursive Character Text Splitter1"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        208,
+        464
+      ],
+      "id": "0d2e602c-46d8-4095-ab1a-a09f4ae273f7",
+      "name": "Embeddings Google Gemini",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "TbbuOGYSmfniUx34",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2160,
+        432
+      ],
+      "id": "c56696cc-72a5-44b8-a947-94070f27adeb",
+      "name": "Embeddings Google Gemini1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "TbbuOGYSmfniUx34",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1296,
+        336
+      ],
+      "id": "5a9348cc-54d3-4ff6-8532-06921c50e851",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "TbbuOGYSmfniUx34",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1136,
+        -64
+      ],
+      "id": "4a2e258a-b095-41bd-9d67-278cb70aef7c",
+      "name": "Loop Over Items1"
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2528,
+        384
+      ],
+      "id": "07f35220-41e8-427f-909a-09c3a42c2dcf",
+      "name": "Wait",
+      "webhookId": "84c60d16-2b6a-45a7-94af-efdefbf6d54f"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI",
+          "mode": "list",
+          "cachedResultName": "G8_merged",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1033838189,
+          "mode": "list",
+          "cachedResultName": "merge_sheet",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit#gid=1033838189"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "a",
+              "displayName": "a",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tình trạng ghi doanh số",
+              "displayName": "Tình trạng ghi doanh số",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tình trạng giao hàng",
+              "displayName": "Tình trạng giao hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tình trạng thanh toán",
+              "displayName": "Tình trạng thanh toán",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Kinh độ ( Giao hàng)",
+              "displayName": "Kinh độ ( Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Vĩ độ ( Giao hàng)",
+              "displayName": "Vĩ độ ( Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ngày đặt hàng",
+              "displayName": "Ngày đặt hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Số ĐĐH từ hệ thống khác",
+              "displayName": "Số ĐĐH từ hệ thống khác",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Mã khách hàng",
+              "displayName": "Mã khách hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Khách hàng",
+              "displayName": "Khách hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Số đơn hàng",
+              "displayName": "Số đơn hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Giá trị đơn hàng",
+              "displayName": "Giá trị đơn hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Hạn thanh toán",
+              "displayName": "Hạn thanh toán",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Mô tả",
+              "displayName": "Mô tả",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Kho",
+              "displayName": "Kho",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Người thực hiện",
+              "displayName": "Người thực hiện",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thực thu",
+              "displayName": "Thực thu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thực thu NT",
+              "displayName": "Thực thu NT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Diễn giải",
+              "displayName": "Diễn giải",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Hàng hóa",
+              "displayName": "Hàng hóa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Giá trị thanh lý",
+              "displayName": "Giá trị thanh lý",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Còn phải thu",
+              "displayName": "Còn phải thu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ngày ghi sổ",
+              "displayName": "Ngày ghi sổ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn vị",
+              "displayName": "Đơn vị",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tên loại hàng hóa",
+              "displayName": "Tên loại hàng hóa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Trạng thái phê duyệt",
+              "displayName": "Trạng thái phê duyệt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tình trạng phê duyệt",
+              "displayName": "Tình trạng phê duyệt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Loại hàng hóa",
+              "displayName": "Loại hàng hóa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "CTKM áp dụng",
+              "displayName": "CTKM áp dụng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Phường/Xã (Giao hàng)",
+              "displayName": "Phường/Xã (Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Quận/Huyện (Giao hàng)",
+              "displayName": "Quận/Huyện (Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tỉnh/Thành phố (Giao hàng)",
+              "displayName": "Tỉnh/Thành phố (Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Mã hàng hóa",
+              "displayName": "Mã hàng hóa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Mã quy cách",
+              "displayName": "Mã quy cách",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn vị tính",
+              "displayName": "Đơn vị tính",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Số lượng",
+              "displayName": "Số lượng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Số lượng giao",
+              "displayName": "Số lượng giao",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn giá sau thuế",
+              "displayName": "Đơn giá sau thuế",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn giá",
+              "displayName": "Đơn giá",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thành tiền NT",
+              "displayName": "Thành tiền NT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thành tiền",
+              "displayName": "Thành tiền",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tỷ lệ chiết khấu",
+              "displayName": "Tỷ lệ chiết khấu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "GIÁ BÁN",
+              "displayName": "GIÁ BÁN",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tiền chiết khấu NT",
+              "displayName": "Tiền chiết khấu NT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tiền chiết khấu",
+              "displayName": "Tiền chiết khấu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thuế suất",
+              "displayName": "Thuế suất",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tiền thuế NT",
+              "displayName": "Tiền thuế NT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tiền thuế",
+              "displayName": "Tiền thuế",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tổng tiền NT",
+              "displayName": "Tổng tiền NT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tổng tiền",
+              "displayName": "Tổng tiền",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Số lô",
+              "displayName": "Số lô",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Hạn sử dụng",
+              "displayName": "Hạn sử dụng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn hàng cha",
+              "displayName": "Đơn hàng cha",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "CTKM",
+              "displayName": "CTKM",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Hàng KM",
+              "displayName": "Hàng KM",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Chiết khấu mặc định",
+              "displayName": "Chiết khấu mặc định",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Chủ sở hữu",
+              "displayName": "Chủ sở hữu",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thẻ",
+              "displayName": "Thẻ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Loại khách hàng",
+              "displayName": "Loại khách hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tên khách hàng",
+              "displayName": "Tên khách hàng",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Địa chỉ (Giao hàng)",
+              "displayName": "Địa chỉ (Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Mã số thuế",
+              "displayName": "Mã số thuế",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Điện thoại",
+              "displayName": "Điện thoại",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Email",
+              "displayName": "Email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Lĩnh vực",
+              "displayName": "Lĩnh vực",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Quận/Huyện (Hóa đơn)",
+              "displayName": "Quận/Huyện (Hóa đơn)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Phường/Xã (Hóa đơn)",
+              "displayName": "Phường/Xã (Hóa đơn)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Hàng hóa đã mua",
+              "displayName": "Hàng hóa đã mua",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Địa chỉ (Hóa đơn)",
+              "displayName": "Địa chỉ (Hóa đơn)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Vĩ độ (Giao hàng)",
+              "displayName": "Vĩ độ (Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Kinh độ (Giao hàng)",
+              "displayName": "Kinh độ (Giao hàng)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tỉnh/Thành phố (Hóa đơn)",
+              "displayName": "Tỉnh/Thành phố (Hóa đơn)",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Ngừng theo dõi",
+              "displayName": "Ngừng theo dõi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tên hàng hóa",
+              "displayName": "Tên hàng hóa",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn vị tính chính",
+              "displayName": "Đơn vị tính chính",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Đơn giá bán",
+              "displayName": "Đơn giá bán",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Thuế GTGT",
+              "displayName": "Thuế GTGT",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Người tạo",
+              "displayName": "Người tạo",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Chiết khấu phê duyệt",
+              "displayName": "Chiết khấu phê duyệt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Bố cục",
+              "displayName": "Bố cục",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Nguồn gốc",
+              "displayName": "Nguồn gốc",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Tính chất",
+              "displayName": "Tính chất",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        400,
+        -544
+      ],
+      "id": "addd1706-95c5-4fb1-91da-2bc8c83410c4",
+      "name": "Tổng hợp dữ liệu",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI",
+          "mode": "list",
+          "cachedResultName": "G8_merged",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1749067867,
+          "mode": "list",
+          "cachedResultName": "rfm_sheet",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit#gid=1749067867"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "customer_id",
+              "displayName": "customer_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "customer_name",
+              "displayName": "customer_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recency",
+              "displayName": "recency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "frequency",
+              "displayName": "frequency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "monetary",
+              "displayName": "monetary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "freq_rank",
+              "displayName": "freq_rank",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "monetary_rank",
+              "displayName": "monetary_rank",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recency_score",
+              "displayName": "recency_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "RFM_score",
+              "displayName": "RFM_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "segment",
+              "displayName": "segment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "warning_products",
+              "displayName": "warning_products",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nhân viên",
+              "displayName": "nhân viên",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ngày gọi",
+              "displayName": "ngày gọi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "đã gọi",
+              "displayName": "đã gọi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {
+          "handlingExtraData": "insertInNewColumn"
+        }
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        608,
+        -288
+      ],
+      "id": "ca8a99b9-596e-46b2-b8bf-44d8c186cfcb",
+      "name": "Tính RFM và quá hạn mua",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "triggerOn": "specificFolder",
+        "folderToWatch": {
+          "__rl": true,
+          "value": "1YLAhe7wC0xn7x62RhNXg38gOD0Qb5BOA",
+          "mode": "list",
+          "cachedResultName": "G8",
+          "cachedResultUrl": "https://drive.google.com/drive/folders/1YLAhe7wC0xn7x62RhNXg38gOD0Qb5BOA"
+        },
+        "event": "fileCreated",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDriveTrigger",
+      "typeVersion": 1,
+      "position": [
+        -592,
+        272
+      ],
+      "id": "c35ace68-10e6-49e5-a2c2-1cefb1257058",
+      "name": "Google Drive Trigger",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "7eC8YE4FRaHn494y",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Khai báo dữ liệu miền và thời tiết\nconst mien_bac = [\n  \"Hà Nội\", \"Hải Phòng\", \"Hải Dương\", \"Hưng Yên\", \"Hà Nam\", \"Nam Định\", \"Thái Bình\", \"Ninh Bình\",\n  \"Bắc Ninh\", \"Bắc Giang\", \"Quảng Ninh\", \"Lạng Sơn\", \"Cao Bằng\", \"Hà Giang\", \"Tuyên Quang\", \"Thái Nguyên\",\n  \"Phú Thọ\", \"Vĩnh Phúc\", \"Hòa Bình\", \"Sơn La\", \"Điện Biên\", \"Lai Châu\", \"Yên Bái\", \"Lào Cai\", \"Bắc Kạn\"\n];\nconst mien_trung = [\n  \"Thanh Hóa\", \"Nghệ An\", \"Hà Tĩnh\", \"Quảng Bình\", \"Quảng Trị\", \"Thừa Thiên Huế\",\n  \"Đà Nẵng\", \"Quảng Nam\", \"Quảng Ngãi\", \"Bình Định\", \"Phú Yên\", \"Khánh Hòa\", \"Ninh Thuận\", \"Bình Thuận\",\n  \"Kon Tum\", \"Gia Lai\", \"Đắk Lắk\", \"Đắk Nông\", \"Lâm Đồng\"\n];\nconst mien_nam = [\n  \"TP. Hồ Chí Minh\", \"Bà Rịa - Vũng Tàu\", \"Bình Dương\", \"Bình Phước\", \"Đồng Nai\", \"Tây Ninh\", \"Long An\",\n  \"Tiền Giang\", \"Bến Tre\", \"Trà Vinh\", \"Vĩnh Long\", \"Đồng Tháp\", \"An Giang\", \"Kiên Giang\", \"Cần Thơ\",\n  \"Hậu Giang\", \"Sóc Trăng\", \"Bạc Liêu\", \"Cà Mau\"\n];\n\n// Pattern thời tiết (rút gọn)\nconst pattern_bac = {\n  1: {\"mua\": \"Mùa Đông\", \"thoi_tiet\": \"Lạnh, khô\", \"nhiet_do_tb\": 16},\n  2: {\"mua\": \"Mùa Xuân\", \"thoi_tiet\": \"Ẩm ướt, mưa phùn\", \"nhiet_do_tb\": 18},\n  3: {\"mua\": \"Mùa Xuân\", \"thoi_tiet\": \"Mát, mưa nhỏ\", \"nhiet_do_tb\": 20},\n  4: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nóng dần, mưa rào\", \"nhiet_do_tb\": 25},\n  5: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nóng, mưa nhiều\", \"nhiet_do_tb\": 29},\n  6: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nóng, mưa bão\", \"nhiet_do_tb\": 32},\n  7: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nắng nóng, mưa rào\", \"nhiet_do_tb\": 33},\n  8: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nắng, mưa nhiều\", \"nhiet_do_tb\": 32},\n  9: {\"mua\": \"Mùa Thu\", \"thoi_tiet\": \"Mát mẻ, ít mưa\", \"nhiet_do_tb\": 28},\n  10: {\"mua\": \"Mùa Thu\", \"thoi_tiet\": \"Mát, khô\", \"nhiet_do_tb\": 24},\n  11: {\"mua\": \"Mùa Đông\", \"thoi_tiet\": \"Lạnh khô\", \"nhiet_do_tb\": 20},\n  12: {\"mua\": \"Mùa Đông\", \"thoi_tiet\": \"Lạnh, hanh khô\", \"nhiet_do_tb\": 17},\n};\nconst pattern_trung = {\n  1: {\"mua\": \"Mùa Đông\", \"thoi_tiet\": \"Mát, mưa rải rác\", \"nhiet_do_tb\": 21},\n  2: {\"mua\": \"Mùa Xuân\", \"thoi_tiet\": \"Mát, ít mưa\", \"nhiet_do_tb\": 22},\n  3: {\"mua\": \"Mùa Xuân\", \"thoi_tiet\": \"Khô ráo, ấm\", \"nhiet_do_tb\": 24},\n  4: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nóng dần\", \"nhiet_do_tb\": 28},\n  5: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nắng nóng\", \"nhiet_do_tb\": 30},\n  6: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nóng, khô\", \"nhiet_do_tb\": 31},\n  7: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nóng, khô\", \"nhiet_do_tb\": 31},\n  8: {\"mua\": \"Mùa Hè\", \"thoi_tiet\": \"Nắng nóng\", \"nhiet_do_tb\": 30},\n  9: {\"mua\": \"Mùa Thu\", \"thoi_tiet\": \"Mưa nhiều, bão\", \"nhiet_do_tb\": 28},\n  10: {\"mua\": \"Mùa Thu\", \"thoi_tiet\": \"Mưa lũ, bão\", \"nhiet_do_tb\": 26},\n  11: {\"mua\": \"Mùa Đông\", \"thoi_tiet\": \"Mưa, se lạnh\", \"nhiet_do_tb\": 23},\n  12: {\"mua\": \"Mùa Đông\", \"thoi_tiet\": \"Mát, mưa\", \"nhiet_do_tb\": 22},\n};\nconst pattern_nam = {\n  1: {\"mua\": \"Mùa khô\", \"thoi_tiet\": \"Nắng, khô\", \"nhiet_do_tb\": 27},\n  2: {\"mua\": \"Mùa khô\", \"thoi_tiet\": \"Nắng nóng\", \"nhiet_do_tb\": 28},\n  3: {\"mua\": \"Mùa khô\", \"thoi_tiet\": \"Nóng, khô\", \"nhiet_do_tb\": 29},\n  4: {\"mua\": \"Chuyển mùa\", \"thoi_tiet\": \"Bắt đầu mưa\", \"nhiet_do_tb\": 30},\n  5: {\"mua\": \"Mùa mưa\", \"thoi_tiet\": \"Mưa nhiều\", \"nhiet_do_tb\": 29},\n  6: {\"mua\": \"Mùa mưa\", \"thoi_tiet\": \"Mưa, ẩm\", \"nhiet_do_tb\": 28},\n  7: {\"mua\": \"Mùa mưa\", \"thoi_tiet\": \"Mưa nhiều\", \"nhiet_do_tb\": 28},\n  8: {\"mua\": \"Mùa mưa\", \"thoi_tiet\": \"Mưa, ngập\", \"nhiet_do_tb\": 28},\n  9: {\"mua\": \"Mùa mưa\", \"thoi_tiet\": \"Mưa lớn\", \"nhiet_do_tb\": 28},\n  10: {\"mua\": \"Mùa mưa\", \"thoi_tiet\": \"Mưa giảm\", \"nhiet_do_tb\": 28},\n  11: {\"mua\": \"Mùa khô\", \"thoi_tiet\": \"Ít mưa, mát\", \"nhiet_do_tb\": 27},\n  12: {\"mua\": \"Mùa khô\", \"thoi_tiet\": \"Khô ráo, mát\", \"nhiet_do_tb\": 27},\n};\n\n// Hàm chọn pattern theo tỉnh\nfunction getWeather(province, month) {\n  let pattern;\n  if (mien_bac.includes(province)) {\n    pattern = pattern_bac;\n  } else if (mien_trung.includes(province)) {\n    pattern = pattern_trung;\n  } else if (mien_nam.includes(province)) {\n    pattern = pattern_nam;\n  }\n  return pattern ? pattern[month] : null;\n}\n\n// Xử lý từng item trong n8n\nreturn items.map(item => {\n  const c = item.json;\n  const date = new Date(c['ngày gọi']);\n  const month = date.getMonth() + 1;\n  const weather = getWeather(c.province, month);\n  const weather_text = weather\n    ? `Tỉnh ${c.province}, ${weather.mua}, ${weather.thoi_tiet}, nhiệt độ TB ~${weather.nhiet_do_tb}°C`\n    : `Không có dữ liệu thời tiết`;\n\n  const prompt = `Dữ liệu khách hàng (chủ yếu là các nhà phân phối và đại lý lớn, rất ít khách lẻ): id: ${c.customer_id}, lần mua gần nhất cách hiện tại: ${c.recency} ngày, số lần mua trong 90 ngày: ${c.frequency}, số tiền mua trong 90 ngày: ${c.monetary}, các sản phẩm quá hạn mua (hôm nay lớn hơn lần mua gần nhất + 0.2 * chu kì mua): ${c.warning_products}, phân khúc: ${c.segment} (RFM = ${c.RFM_score}), thời tiết hiện tại để xác định sản phẩm theo mùa: ${weather_text}. Trước tiên, hãy tìm kiếm trong tài liệu nội bộ để xem có các sản phẩm nào phù hợp với thời tiết hiện tại. Sau đó, hãy gợi ý Next Best Action (cross-sell, up-sell, core-product-repeat,...) trong 1–2 câu ngắn gọn cho nhân viên CSKH một cách sáng tạo hiệu quả, bỏ qua các từ ngữ xưng hô thừa của mô hình AI.`;\n\n  return { json: { ...c, prompt } };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        816,
+        -64
+      ],
+      "id": "d98606b5-1ab1-4338-a096-ccdc4fb6bbc1",
+      "name": "Tạo prompt"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1312,
+        -240
+      ],
+      "id": "06a1469c-6e5e-4526-8671-463cd2715bdc",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const c = item.json;\n\n  let prompt_groq = `\n  Hướng dẫn:\n  I. Khung Kịch bản Chung (Cho Nhà phân phối và Đại lý)\n  Nguyên tắc chung:\n  Mục tiêu của đối tượng: Giúp nhà phân phối/đại lý tối đa hóa doanh số bán lẻ, quản lý tồn kho hiệu quả và cung cấp giải pháp toàn diện cho khách hàng cuối của họ.\n  Tiếp cận: Luôn tập trung vào lợi ích cho việc kinh doanh của họ (tăng lợi nhuận, giảm chi phí, tăng sự hài lòng của khách hàng cuối, hỗ trợ bán hàng).\n  1. Kịch bản Up-sell (Bán tăng giá trị)\n  Mô tả: Đề xuất khách hàng nâng cấp hoặc chuyển sang mua các sản phẩm có giá trị cao hơn, nhiều tính năng hơn, hoặc phiên bản cao cấp hơn của sản phẩm họ đang quan tâm/đã mua.\n  Ví dụ: Nếu khách hàng đang mua Đèn pin, đèn tích điện, hãy gợi ý thêm Đèn LED pha ngoài trời hoặc Đèn dây chống nước.\n  2. Kịch bản Cross-sell (Bán chéo)\n  Mô tả: Gợi ý khách hàng mua thêm các sản phẩm bổ sung, có liên quan hoặc đi kèm.\n  Ví dụ: Khi mua ổ cắm GONGNIU, gợi ý kèm theo Dây rút nhựa G8Home.\n  3. Kịch bản Core-Product-Repeat (Bán lặp lại sản phẩm cốt lõi)\n  Mô tả: Khuyến khích khách hàng tiếp tục đặt hàng các sản phẩm chủ lực mà họ đã mua thường xuyên.\n  Ví dụ: Khách hàng mua Coca Cola lốc 6 lon → gợi ý đặt cả thùng 24 lon để tiết kiệm chi phí.\n  II. Khung Next Best Action (NBA) cho Khách hàng B2B\n  NBA 1: Chuẩn bị mùa mưa bão → Gợi ý sản phẩm an toàn điện, chiếu sáng khẩn cấp.\n  NBA 2: Tối ưu đơn hàng tiêu dùng nhanh → Gợi ý chuyển từ lốc nhỏ sang thùng lớn.\n  NBA 3: Nâng cấp quản lý điện → Gợi ý mua kèm dây rút nhựa với ổ cắm.\n  Yêu cầu: \n  Dựa theo dữ liệu next_best_action đã xây dựng trước đó: ${c.output}, hãy vận dụng nguyên tắc trên và đưa ra kịch bản.\n  `;\n\n  // Loại bỏ ký tự đặc biệt, chỉ giữ chữ, số, dấu câu cơ bản\n  prompt_groq = prompt_groq\n    .replace(/\\s+/g, ' ')        // gộp nhiều khoảng trắng, xuống dòng thành 1 space\n    .replace(/[^\\wÀ-ỹ0-9.,:;?!%()/-]/g, ' ') // loại bỏ ký tự lạ nhưng giữ dấu tiếng Việt\n\n  return { json: { prompt_groq: prompt_groq.trim() } };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1888,
+        -240
+      ],
+      "id": "ee2785d8-edd8-41da-bc04-66f86fec5c1a",
+      "name": "Tạo prompt 2 cho groq"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nconst apiKey = \"\";  \nconst url = \"https://api.groq.com/openai/v1/chat/completions\";\n\nconst sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));\n\nconst batchSize = 5;\nlet results = [];\n\nfor (let i = 0; i < items.length; i += batchSize) {\n  const batch = items.slice(i, i + batchSize);\n\n  const requests = batch.map(async (item) => {\n    const prompt = item.json.prompt_groq;\n\n    try {\n      const response = await this.helpers.httpRequest({\n        method: \"POST\",\n        url,\n        headers: { \n          \"Content-Type\": \"application/json\",\n          \"Authorization\": `Bearer ${apiKey}`\n        },\n        body: {\n          model: \"llama-3.1-8b-instant\",\n          messages: [{ role: \"user\", content: prompt }]\n        },\n        json: true\n      });\n\n      return response.choices?.[0]?.message?.content || \"\";\n    } catch (error) {\n      return `❌ Error: ${error.message}`;\n    }\n  });\n\n  const batchResults = await Promise.all(requests);\n  results.push(...batchResults);\n\n  if (i + batchSize < items.length) {\n    await sleep(2000);\n  }\n}\n\n// chỉ trả về 1 field duy nhất\nreturn [\n  {\n    json: {\n      groq_response: results\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2608,
+        0
+      ],
+      "id": "a29b38f9-a07a-47ff-8ded-a83c184373a6",
+      "name": "groq"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2272,
+        -240
+      ],
+      "id": "dde23fb2-b86c-4aae-96b0-0fb9a75132cc",
+      "name": "Loop Over Items2"
+    },
+    {
+      "parameters": {
+        "amount": 15
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2976,
+        0
+      ],
+      "id": "471d43f0-5496-4e76-a9c0-69b1b52e2ca8",
+      "name": "Wait1",
+      "webhookId": "84c60d16-2b6a-45a7-94af-efdefbf6d54f"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2432,
+        -480
+      ],
+      "id": "42314eda-729f-4ce6-868e-5f5ad6d6f4e2",
+      "name": "Merge2"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI",
+          "mode": "list",
+          "cachedResultName": "G8_merged",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 375755827,
+          "mode": "list",
+          "cachedResultName": "dsgoi_homnay",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit#gid=375755827"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "customer_id",
+              "displayName": "customer_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email",
+              "displayName": "email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "customer_name",
+              "displayName": "customer_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "province",
+              "displayName": "province",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recency",
+              "displayName": "recency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "frequency",
+              "displayName": "frequency",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "monetary",
+              "displayName": "monetary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "freq_rank",
+              "displayName": "freq_rank",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "monetary_rank",
+              "displayName": "monetary_rank",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recency_score",
+              "displayName": "recency_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "RFM_score",
+              "displayName": "RFM_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "segment",
+              "displayName": "segment",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "warning_products",
+              "displayName": "warning_products",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "nhân viên",
+              "displayName": "nhân viên",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ngày gọi",
+              "displayName": "ngày gọi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "đã gọi",
+              "displayName": "đã gọi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "output",
+              "displayName": "output",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2720,
+        -288
+      ],
+      "id": "17421d7c-caec-44fb-bb63-5013a7991ee3",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {}
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "value": "1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI",
+          "mode": "list",
+          "cachedResultName": "G8_merged",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 375755827,
+          "mode": "list",
+          "cachedResultName": "dsgoi_homnay",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit#gid=375755827"
+        },
+        "event": "rowAdded",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        928,
+        944
+      ],
+      "id": "5d00929e-097b-4805-ad85-885db2310be6",
+      "name": "Google Sheets Trigger",
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "u3jkmfU7rBUlmGiE",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Dữ liệu khách hàng:\n - Id:  {{ $json.customer_id }}\n - Tỉnh thành: {{ $json.province }}\n - Lần mua gần nhất cách đây: {{ $json.recency }}\n - Số lần mua trong 90 ngày: {{ $json.frequency }}\n - Số tiền mua trong 90 ngày: {{ $json.monetary }}\n - Phân khúc: {{ $json.segment }}\n - Các sản phẩm quá hạn mua: {{ $json.warning_products }}\n - RFM_score: {{ $json.RFM_score }}\n - Ngày gọi: {{ $json['ngày gọi'] }}\n - Khung kịch bản: {{ $json.groq_response }}\n - Next_best_action: {{ $json.output }}\nHãy xây dựng 3 bước kịch bản. Yêu cầu: một nhân viên mới vào làm chưa rõ về các sản phẩm có thể dựa theo các bước kịch bản này để gọi điện cho khách, anh ấy (chị ấy) có thể chọn 1 trong 3 để làm việc và tham khảo 2 bước kịch bản còn lại (có thể dùng hết cả 3). Bỏ qua các từ ngữ xưng hô và chào dư thừa tạo ra bởi mô hình AI, tập trung vào giá trị, sự tự nhiên, độ hiểu quả. Không xưng hô cứng nhắc với khách hàng theo id mà gọi là anh (chị), không xưng tôi mà xưng em, bỏ qua các câu thể hiện cảm xúc. Không dùng từ \"quá hạn mua\". Bắt đầu câu trả lời như: Bước kịch bản 1: .... Sau khi đã đưa ra output, thêm vào cuối các kịch bản câu này nhé: Để tiện cho anh/chị, em sẽ gửi thông tin chi tiết và trao đổi trực tiếp qua Zalo luôn nhé. \nLưu ý: Cần truy xuất dữ liệu nội bộ trước đó để xem có chương trình khuyến mãi nào đang diễn ra không",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        2048,
+        960
+      ],
+      "id": "ca4d9613-b8b4-4192-93ca-7288b388675e",
+      "name": "AI Agent2"
+    },
+    {
+      "parameters": {
+        "name": "dulieu",
+        "description": "Chứa dữ liệu nội bộ, truy vấn để tìm thông tin trả lời câu hỏi của người dùng"
+      },
+      "type": "@n8n/n8n-nodes-langchain.toolVectorStore",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        1136
+      ],
+      "id": "7a707294-1878-47c2-bbf7-7b2723659736",
+      "name": "Answer questions with a vector store2"
+    },
+    {
+      "parameters": {
+        "pineconeIndex": {
+          "__rl": true,
+          "value": "n8nself",
+          "mode": "list",
+          "cachedResultName": "n8nself"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePinecone",
+      "typeVersion": 1,
+      "position": [
+        2352,
+        1344
+      ],
+      "id": "1dcbaa03-f9e3-4742-9367-fbf01a7c2ad6",
+      "name": "Pinecone Vector Store3",
+      "credentials": {
+        "pineconeApi": {
+          "id": "QJxs3mRXmRCzt2Zc",
+          "name": "PineconeApi account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2608,
+        1552
+      ],
+      "id": "2edf030e-8a92-44a1-8312-5b0d9f0d8000",
+      "name": "Embeddings Google Gemini3",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "TbbuOGYSmfniUx34",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1888,
+        1392
+      ],
+      "id": "616f6a98-e4ec-40c5-9665-100805ce30b1",
+      "name": "Google Gemini Chat Model2",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "qCQ69FfbcAhIMfQR",
+          "name": "Google Gemini(PaLM) Api account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1664,
+        944
+      ],
+      "id": "da3b55ab-4875-4785-8da1-6b652775bd45",
+      "name": "Loop Over Items3"
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2944,
+        1552
+      ],
+      "id": "41bc576a-91bd-4998-ba05-ee7d8569a16a",
+      "name": "Wait2",
+      "webhookId": "0e93383b-bd48-498a-aaba-a70bb5e0b12c"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1952,
+        736
+      ],
+      "id": "d3400357-592b-42ab-ad38-21c814a7881f",
+      "name": "Merge3"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI",
+          "mode": "list",
+          "cachedResultName": "G8_merged",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 375755827,
+          "mode": "list",
+          "cachedResultName": "dsgoi_homnay",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit#gid=375755827"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1216,
+        944
+      ],
+      "id": "b5696e2a-852b-4097-9edb-54fca7b1b547",
+      "name": "Get row(s) in sheet5",
+      "executeOnce": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const c = item.json;\n  let customer_id = c[\"customer_id\"];\n  let staff = c[\"nhân viên\"];\n  let day = c[\"ngày gọi\"];\n  let status = c[\"đã gọi\"];\n  let script = c[\"output\"];\n\n  return { \n    json: { \n      customer_id: customer_id,\n      staff: staff, \n      day: day, \n      status: status, \n      script: script \n    } \n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2256,
+        736
+      ],
+      "id": "f9772caa-027b-4d8d-962c-842b8cdb2b0b",
+      "name": "Code2"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI",
+          "mode": "list",
+          "cachedResultName": "G8_merged",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 201498065,
+          "mode": "list",
+          "cachedResultName": "kichbangoi",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1DljI5oh1gjqKQJ0akYvrd7JUJ2piyJgOKmD0F76U1BI/edit#gid=201498065"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "staff",
+              "displayName": "staff",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "day",
+              "displayName": "day",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "script",
+              "displayName": "script",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        2528,
+        736
+      ],
+      "id": "979c0b1c-9923-413e-b278-67184dbafd70",
+      "name": "Append row in sheet1",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "vcFuBLcenhRuydKy",
+          "name": "Google Sheets account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "RFM": {
+      "main": [
+        [
+          {
+            "node": "sort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "sort": {
+      "main": [
+        [
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get row(s) in sheet3",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get row(s) in sheet4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet1": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet3": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet4": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Tổng hợp dữ liệu",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "Tính RFM và quá hạn mua",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Tạo prompt",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "search_file": {
+      "main": [
+        [
+          {
+            "node": "dowload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "dowload": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Pinecone Vector Store2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer questions with a vector store": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pinecone Vector Store1": {
+      "ai_vectorStore": [
+        [
+          {
+            "node": "Answer questions with a vector store",
+            "type": "ai_vectorStore",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pinecone Vector Store2": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Default Data Loader1": {
+      "ai_document": [
+        [
+          {
+            "node": "Pinecone Vector Store2",
+            "type": "ai_document",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recursive Character Text Splitter1": {
+      "ai_textSplitter": [
+        [
+          {
+            "node": "Default Data Loader1",
+            "type": "ai_textSplitter",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings Google Gemini": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Pinecone Vector Store2",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings Google Gemini1": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Pinecone Vector Store1",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "Answer questions with a vector store",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items1": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tổng hợp dữ liệu": {
+      "main": [
+        [
+          {
+            "node": "RFM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Drive Trigger": {
+      "main": [
+        [
+          {
+            "node": "search_file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tính RFM và quá hạn mua": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tạo prompt": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Tạo prompt 2 cho groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tạo prompt 2 cho groq": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items2": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "groq": {
+      "main": [
+        [
+          {
+            "node": "Wait1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait1": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge2": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        []
+      ]
+    },
+    "Google Sheets Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer questions with a vector store2": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pinecone Vector Store3": {
+      "ai_vectorStore": [
+        [
+          {
+            "node": "Answer questions with a vector store2",
+            "type": "ai_vectorStore",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embeddings Google Gemini3": {
+      "ai_embedding": [
+        [
+          {
+            "node": "Pinecone Vector Store3",
+            "type": "ai_embedding",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Answer questions with a vector store2",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "AI Agent2",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items3": {
+      "main": [
+        [
+          {
+            "node": "Merge3",
+            "type": "main",
+            "index": 1
+          }
+        ],
+        [
+          {
+            "node": "AI Agent2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent2": {
+      "main": [
+        [
+          {
+            "node": "Wait2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait2": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet5": {
+      "main": [
+        [
+          {
+            "node": "Merge3",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Loop Over Items3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge3": {
+      "main": [
+        [
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "0afc1687-abd0-4705-b7e9-f9f6c670949d",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "de0bece1344424c4a13a3ebb6169a7d705acf59e3831a99435f1c94e798dd8e8"
+  },
+  "id": "zOjYhqwINubZ4Ezb",
+  "tags": []
+}
